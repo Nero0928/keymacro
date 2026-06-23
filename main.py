@@ -12,6 +12,7 @@ import time
 import threading
 import json
 import os
+import ctypes
 import tkinter as tk
 from tkinter import ttk, messagebox
 
@@ -123,50 +124,194 @@ def _post_key(hwnd, msg, vk, scan_or_0):
     except Exception:
         return False
 
+# ── SendInput 相關（用於 DirectInput 遊戲）─────────────────────
+# ctypes 結構定義
+PUL = ctypes.POINTER(ctypes.c_ulong)
+
+class KeyBdInput(ctypes.Structure):
+    _fields_ = [
+        ("wVk", ctypes.c_ushort),
+        ("wScan", ctypes.c_ushort),
+        ("dwFlags", ctypes.c_ulong),
+        ("time", ctypes.c_ulong),
+        ("dwExtraInfo", PUL)
+    ]
+
+class HardwareInput(ctypes.Structure):
+    _fields_ = [
+        ("uMsg", ctypes.c_ulong),
+        ("wParamL", ctypes.c_short),
+        ("wParamH", ctypes.c_ushort)
+    ]
+
+class MouseInput(ctypes.Structure):
+    _fields_ = [
+        ("dx", ctypes.c_long),
+        ("dy", ctypes.c_long),
+        ("mouseData", ctypes.c_ulong),
+        ("dwFlags", ctypes.c_ulong),
+        ("time", ctypes.c_ulong),
+        ("dwExtraInfo", PUL)
+    ]
+
+class InputUnion(ctypes.Union):
+    _fields_ = [
+        ("ki", KeyBdInput),
+        ("mi", MouseInput),
+        ("hi", HardwareInput)
+    ]
+
+class Input(ctypes.Structure):
+    _fields_ = [
+        ("type", ctypes.c_ulong),
+        ("ii", InputUnion)
+    ]
+
+INPUT_KEYBOARD = 1
+KEYEVENTF_SCANCODE = 0x0008
+KEYEVENTF_KEYUP = 0x0002
+KEYEVENTF_UNICODE = 0x0004
+
+user32 = ctypes.windll.user32
+
+def _sendinput_key(vk, scan, down=True):
+    """使用 SendInput 發送單一 keybd_event"""
+    flags = KEYEVENTF_SCANCODE
+    if not down:
+        flags |= KEYEVENTF_KEYUP
+    
+    extra = ctypes.c_ulong(0)
+    ii_ary = Input * 1
+    ii = ii_ary()
+    ii[0].type = INPUT_KEYBOARD
+    ii[0].ii.ki = KeyBdInput(vk, scan, flags, 0, ctypes.pointer(extra))
+    
+    x = user32.SendInput(1, ctypes.byref(ii), ctypes.sizeof(ii[0]))
+    return x == 1
+
+def _attach_and_send(target_hwnd, vk, scan, modifiers, hold_ms=50):
+    """
+    附著到目標視窗執行緒，用 SendInput 發送按鍵（適用於 DirectInput 遊戲）
+    """
+    try:
+        # 取得目標視窗的執行緒 ID
+        target_tid = user32.GetWindowThreadProcessId(target_hwnd, 0)
+        # 取得目前執行緒 ID
+        current_tid = user32.GetCurrentThreadId()
+        
+        # 附著到目標執行緒（这样 SendInput 会发送到目标窗口）
+        user32.AttachThreadInput(current_tid, target_tid, True)
+        
+        # 發送修飾鍵
+        for mod in modifiers:
+            if mod in MODIFIER_VK:
+                m_vk, m_scan = MODIFIER_VK[mod]
+                _sendinput_key(m_vk, m_scan, down=True)
+        
+        time.sleep(0.005)
+        
+        # 主按鍵 DOWN
+        _sendinput_key(vk, scan, down=True)
+        time.sleep(hold_ms / 1000.0)
+        
+        # 主按鍵 UP
+        _sendinput_key(vk, scan, down=False)
+        time.sleep(0.005)
+        
+        # 釋放修飾鍵
+        for mod in reversed(modifiers):
+            if mod in MODIFIER_VK:
+                m_vk, m_scan = MODIFIER_VK[mod]
+                _sendinput_key(m_vk, m_scan, down=False)
+        
+        # 解除附著
+        user32.AttachThreadInput(current_tid, target_tid, False)
+        return True
+    except Exception as e:
+        try:
+            user32.AttachThreadInput(current_tid, target_tid, False)
+        except:
+            pass
+        return False
+
 def send_key_to_window(hwnd, vk, scan, modifiers, hold_ms=50, stop_event=None):
-    """發送單一按鍵（含輔助鍵），使用 PostMessage 非同步發送"""
+    """
+    發送單一按鍵（含輔助鍵）。
+    策略：
+    1. 先用 PostMessage（標準 Win32 視窗）
+    2. PostMessage 失敗時，用 AttachThreadInput + SendInput（DirectInput 遊戲）
+    """
     scan_down = (scan << 16) | 1
     scan_up = (scan << 16) | 1 | 0xC0000000
 
-    # 發送修飾鍵 DOWN
-    for mod in modifiers:
+    # 先嘗試 PostMessage
+    post_success = False
+    try:
+        # 發送修飾鍵 DOWN
+        for mod in modifiers:
+            if stop_event and stop_event.is_set():
+                return
+            if mod in MODIFIER_VK:
+                m_vk, _ = MODIFIER_VK[mod]
+                _post_key(hwnd, WM_KEYDOWN, m_vk, 0)
+
         if stop_event and stop_event.is_set():
+            for mod in reversed(modifiers):
+                if mod in MODIFIER_VK:
+                    m_vk, _ = MODIFIER_VK[mod]
+                    _post_key(hwnd, WM_KEYUP, m_vk, 0)
             return
-        if mod in MODIFIER_VK:
-            m_vk, _ = MODIFIER_VK[mod]
-            _post_key(hwnd, WM_KEYDOWN, m_vk, 0)
 
-    if stop_event and stop_event.is_set():
-        # 清理已按下的修飾鍵
-        for mod in reversed(modifiers):
-            if mod in MODIFIER_VK:
-                m_vk, _ = MODIFIER_VK[mod]
-                _post_key(hwnd, WM_KEYUP, m_vk, 0)
-        return
+        time.sleep(0.008)
 
-    time.sleep(0.008)
+        # 主按鍵 DOWN
+        _post_key(hwnd, WM_KEYDOWN, vk, scan_down)
+        time.sleep(hold_ms / 1000.0)
 
-    # 主按鍵 DOWN
-    _post_key(hwnd, WM_KEYDOWN, vk, scan_down)
-    time.sleep(hold_ms / 1000.0)
+        if stop_event and stop_event.is_set():
+            _post_key(hwnd, WM_KEYUP, vk, scan_up)
+            for mod in reversed(modifiers):
+                if mod in MODIFIER_VK:
+                    m_vk, _ = MODIFIER_VK[mod]
+                    _post_key(hwnd, WM_KEYUP, m_vk, 0)
+            return
 
-    if stop_event and stop_event.is_set():
+        # 主按鍵 UP
         _post_key(hwnd, WM_KEYUP, vk, scan_up)
+        time.sleep(0.008)
+
+        # 釋放修飾鍵 UP
         for mod in reversed(modifiers):
             if mod in MODIFIER_VK:
                 m_vk, _ = MODIFIER_VK[mod]
                 _post_key(hwnd, WM_KEYUP, m_vk, 0)
-        return
+        
+        post_success = True
+    except Exception:
+        pass
 
-    # 主按鍵 UP
-    _post_key(hwnd, WM_KEYUP, vk, scan_up)
-    time.sleep(0.008)
+    # 如果 PostMessage 失敗（通常是 DirectInput 遊戲），使用 AttachThreadInput + SendInput
+    if not post_success:
+        _attach_and_send(hwnd, vk, scan, modifiers, hold_ms)
 
-    # 釋放修飾鍵 UP（倒序）
-    for mod in reversed(modifiers):
-        if mod in MODIFIER_VK:
-            m_vk, _ = MODIFIER_VK[mod]
-            _post_key(hwnd, WM_KEYUP, m_vk, 0)
+    # 如果兩者都失敗，最後手段：直接 SendInput（系統範圍）
+    if not post_success:
+        try:
+            for mod in modifiers:
+                if mod in MODIFIER_VK:
+                    m_vk, m_scan = MODIFIER_VK[mod]
+                    _sendinput_key(m_vk, m_scan, down=True)
+            time.sleep(0.005)
+            _sendinput_key(vk, scan, down=True)
+            time.sleep(hold_ms / 1000.0)
+            _sendinput_key(vk, scan, down=False)
+            time.sleep(0.005)
+            for mod in reversed(modifiers):
+                if mod in MODIFIER_VK:
+                    m_vk, m_scan = MODIFIER_VK[mod]
+                    _sendinput_key(m_vk, m_scan, down=False)
+        except Exception:
+            pass
 
 def find_window_by_title(title: str):
     """透過視窗標題尋找 hwnd"""
