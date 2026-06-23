@@ -95,7 +95,7 @@ MODIFIER_VK = {
 }
 
 # ═══════════════════════════════════════════════════════════
-#  按鍵發送核心（使用 PostMessage 發至背景視窗）
+#  按鍵發送核心
 # ═══════════════════════════════════════════════════════════
 
 def parse_key(key_str: str):
@@ -117,33 +117,48 @@ def parse_key(key_str: str):
     
     return None, None, modifiers
 
-def send_key_to_window(hwnd: int, vk: int, scan: int, modifiers: list, hold_ms: float = 50):
-    """發送單一按鍵至指定視窗（含輔助鍵）"""
+def send_key_to_window(hwnd: int, vk: int, scan: int, modifiers: list, hold_ms: float = 50, stop_event=None):
+    """發送單一按鍵至指定視窗（含輔助鍵），使用 SendMessage 並附帶重試"""
     WM_KEYDOWN = 0x0100
     WM_KEYUP = 0x0101
-    WM_SYSKEYDOWN = 0x0104
-    WM_SYSKEYUP = 0x0105
     
-    # 發送修飾鍵
-    for mod in modifiers:
-        if mod in MODIFIER_VK:
-            mod_vk, _ = MODIFIER_VK[mod]
-            win32api.PostMessage(hwnd, WM_KEYDOWN, mod_vk, 0)
+    scan_with_flags = (scan << 16) | 1
+    scan_release = (scan << 16) | 1 | 0xC0000000
     
-    time.sleep(0.01)
+    def do_send():
+        # 發送修飾鍵 DOWN
+        for mod in modifiers:
+            if mod in MODIFIER_VK:
+                mod_vk, _ = MODIFIER_VK[mod]
+                win32api.SendMessage(hwnd, WM_KEYDOWN, mod_vk, 0)
+        
+        time.sleep(0.005)
+        
+        # 發送主按鍵 DOWN
+        win32api.SendMessage(hwnd, WM_KEYDOWN, vk, scan_with_flags)
+        time.sleep(hold_ms / 1000.0)
+        
+        # 主按鍵 UP
+        win32api.SendMessage(hwnd, WM_KEYUP, vk, scan_release)
+        time.sleep(0.005)
+        
+        # 釋放修飾鍵 UP（倒序）
+        for mod in reversed(modifiers):
+            if mod in MODIFIER_VK:
+                mod_vk, _ = MODIFIER_VK[mod]
+                win32api.SendMessage(hwnd, WM_KEYUP, mod_vk, 0xC0000000)
     
-    # 發送主按鍵
-    win32api.PostMessage(hwnd, WM_KEYDOWN, vk, (scan << 16) | 1)
-    time.sleep(hold_ms / 1000.0)
-    win32api.PostMessage(hwnd, WM_KEYUP, vk, (scan << 16) | 1 | 0xC0000000)
-    
-    time.sleep(0.01)
-    
-    # 釋放修飾鍵（倒序）
-    for mod in reversed(modifiers):
-        if mod in MODIFIER_VK:
-            mod_vk, _ = MODIFIER_VK[mod]
-            win32api.PostMessage(hwnd, WM_KEYUP, mod_vk, 0xC0000000)
+    # 重試機制（某些遊戲需要多試幾次）
+    for attempt in range(3):
+        if stop_event and stop_event.is_set():
+            return
+        try:
+            if win32gui.IsWindow(hwnd):
+                do_send()
+                return
+        except Exception:
+            pass
+        time.sleep(0.01)
 
 def find_window_by_title(title: str) -> int:
     """透過視窗標題尋找 hwnd"""
@@ -167,7 +182,6 @@ def get_all_windows() -> list:
         if win32gui.IsWindowVisible(hwnd):
             title = win32gui.GetWindowText(hwnd).strip()
             if title and title not in seen_titles:
-                # 排除系統視窗
                 try:
                     cls_name = win32gui.GetClassName(hwnd)
                     if cls_name in ('WorkerW', 'Shell_TrayWnd', 'DV2ControlHost', 
@@ -180,36 +194,42 @@ def get_all_windows() -> list:
         return True
     
     win32gui.EnumWindows(callback, None)
-    # 按視窗標題排序
     windows.sort(key=lambda x: x[0].lower())
     return windows
 
-def send_macro_sequence(sequence: list, hwnd: int, hold_ms: float, interval_ms: float, repeat: int):
-    """發送一連串按鍵（巨集）"""
+def send_macro_sequence(sequence: list, hwnd: int, hold_ms: float, interval_ms: float, repeat: int, stop_event=None):
+    """發送一連串按鍵（巨集），服從 stop_event 可隨時中斷"""
     for _ in range(repeat):
         for key_str in sequence:
+            if stop_event and stop_event.is_set():
+                return
             if hwnd == 0 or not win32gui.IsWindow(hwnd):
                 return
             vk, scan, modifiers = parse_key(key_str)
             if vk:
-                send_key_to_window(hwnd, vk, scan, modifiers, hold_ms)
+                send_key_to_window(hwnd, vk, scan, modifiers, hold_ms, stop_event)
+            if stop_event and stop_event.is_set():
+                return
             time.sleep(interval_ms / 1000.0)
 
 # ═══════════════════════════════════════════════════════════
-#  熱鍵監聽（pynput）
+#  熱鍵監聽（支援兩個獨立熱鍵 + Toggle 模式）
 # ═══════════════════════════════════════════════════════════
 
-class HotkeyListener:
-    def __init__(self, on_activate, on_stop):
-        self.on_activate = on_activate
+class HotkeyManager:
+    def __init__(self, on_trigger, on_stop):
+        self.on_trigger = on_trigger
         self.on_stop = on_stop
-        self.current_key = None
-        self.listener = None
+        self.trigger_key = None
+        self.stop_key = None
+        self.trigger_listener = None
+        self.stop_listener = None
         self._running = False
-        self._key_held = False
+        self._trigger_key_held = False
+        self._is_toggle_mode = False
+        self._macro_active = False
     
     def _convert_key(self, key):
-        """將 pynput Key/KeyCode 轉為字串"""
         if isinstance(key, Key):
             name = key.name.lower()
             if name in ('alt_l', 'alt_r'): return 'alt'
@@ -223,7 +243,6 @@ class HotkeyListener:
         return str(key).replace("'", "").lower()
     
     def _normalize_key(self, s: str) -> str:
-        """標準化按鍵名稱"""
         mapping = {
             'control': 'ctrl', 'control_l': 'ctrl', 'control_r': 'ctrl',
             'alt_l': 'alt', 'alt_r': 'alt',
@@ -233,36 +252,76 @@ class HotkeyListener:
         }
         return mapping.get(s, s)
     
-    def on_press(self, key):
-        key_name = self._convert_key(key)
-        key_name = self._normalize_key(key_name)
+    def _trigger_on_press(self, key):
+        key_name = self._normalize_key(self._convert_key(key))
         
-        if key_name == self.current_key and not self._key_held:
-            self._key_held = True
-            threading.Thread(target=self._delayed_activate, daemon=True).start()
+        # Toggle 模式：觸發鍵按下時切換狀態
+        if self._is_toggle_mode and key_name == self.trigger_key:
+            if not self._trigger_key_held:
+                self._trigger_key_held = True
+                if self._macro_active:
+                    # 停止巨集
+                    self.on_stop()
+                    self._macro_active = False
+                else:
+                    # 啟動巨集
+                    self._macro_active = True
+                    threading.Thread(target=self._delayed_trigger, daemon=True).start()
+        # 一般模式：按住觸發鍵執行
+        elif not self._is_toggle_mode and key_name == self.trigger_key and not self._trigger_key_held:
+            self._trigger_key_held = True
+            threading.Thread(target=self._delayed_trigger, daemon=True).start()
     
-    def _delayed_activate(self):
+    def _delayed_trigger(self):
         time.sleep(0.05)
-        if self._key_held and self._running:
-            self.on_activate()
+        if self._running and self._trigger_key_held:
+            self.on_trigger()
     
-    def on_release(self, key):
-        key_name = self._convert_key(key)
-        key_name = self._normalize_key(key_name)
-        if key_name == self.current_key:
-            self._key_held = False
+    def _trigger_on_release(self, key):
+        key_name = self._normalize_key(self._convert_key(key))
+        if key_name == self.trigger_key:
+            self._trigger_key_held = False
     
-    def start(self, hotkey: str):
-        self.current_key = self._normalize_key(hotkey)
+    def _stop_on_press(self, key):
+        key_name = self._normalize_key(self._convert_key(key))
+        if key_name == self.stop_key:
+            self.on_stop()
+            self._macro_active = False
+    
+    def start(self, trigger: str, stop: str, toggle_mode: bool):
+        self.trigger_key = self._normalize_key(trigger)
+        self.stop_key = self._normalize_key(stop)
+        self._is_toggle_mode = toggle_mode
         self._running = True
-        self._key_held = False
-        self.listener = KbListener(on_press=self.on_press, on_release=self.on_release)
-        self.listener.start()
+        self._trigger_key_held = False
+        self._macro_active = False
+        
+        self.trigger_listener = KbListener(
+            on_press=self._trigger_on_press,
+            on_release=self._trigger_on_release
+        )
+        self.trigger_listener.start()
+        
+        # 停止熱鍵只在非 Toggle 模式需要獨立監聽
+        if not toggle_mode and self.stop_key != self.trigger_key:
+            self.stop_listener = KbListener(
+                on_press=self._stop_on_press,
+                on_release=lambda key: None
+            )
+            self.stop_listener.start()
     
     def stop(self):
         self._running = False
-        if self.listener:
-            self.listener.stop()
+        self._macro_active = False
+        if self.trigger_listener:
+            self.trigger_listener.stop()
+            self.trigger_listener = None
+        if self.stop_listener:
+            self.stop_listener.stop()
+            self.stop_listener = None
+    
+    def is_active(self):
+        return self._macro_active
 
 # ═══════════════════════════════════════════════════════════
 #  GUI 主體
@@ -272,25 +331,29 @@ class KeyMacroGUI:
     def __init__(self, root: tk.Tk):
         self.root = root
         self.root.title("KeyMacro — 背景遊戲按鍵發送器")
-        self.root.geometry("700x600")
+        self.root.geometry("720x640")
         self.root.resizable(False, False)
         
         self.hotkey_str = tk.StringVar(value="f1")
+        self.stop_hotkey_str = tk.StringVar(value="f2")
         self.target_window = tk.StringVar(value="")
-        self.sequence_str = tk.StringVar(value="a, b, c")
         self.hold_ms = tk.IntVar(value=50)
         self.interval_ms = tk.IntVar(value=100)
         self.repeat_count = tk.IntVar(value=1)
         self.delay_before = tk.IntVar(value=500)
+        self.toggle_mode = tk.BooleanVar(value=False)
         self.is_running = False
-        self.listener_thread = None
-        self.stop_hotkey = "f2"
         self.window_var = tk.StringVar(value="")
         self.window_list = []  # (title, hwnd)
         
-        self.listener = HotkeyListener(
-            on_activate=self._execute_macro,
-            on_stop=self._stop_macro
+        # 執行緒控制
+        self.stop_event = threading.Event()
+        self.active_threads = []
+        self.lock = threading.Lock()
+        
+        self.manager = HotkeyManager(
+            on_trigger=self._execute_macro,
+            on_stop=self._stop_all
         )
         
         self._build_ui()
@@ -302,107 +365,139 @@ class KeyMacroGUI:
         style.configure("Title.TLabel", font=("Microsoft JhengHei", 14, "bold"))
         style.configure("Sub.TLabel", font=("Microsoft JhengHei", 10))
         
-        # ── 主框架 ──────────────────────────────────────
         main_frame = ttk.Frame(self.root, padding=15)
         main_frame.pack(fill="both", expand=True)
         
         # ── 標題 ───────────────────────────────────────
-        ttk.Label(main_frame, text="🎮 KeyMacro", style="Title.TLabel").grid(row=0, column=0, columnspan=3, sticky="w", pady=(0, 10))
+        ttk.Label(main_frame, text="🎮 KeyMacro", style="Title.TLabel").grid(
+            row=0, column=0, columnspan=4, sticky="w", pady=(0, 8))
         
-        # ── 觸發鍵設定 ─────────────────────────────────
+        # ── 熱鍵設定 ─────────────────────────────────
         row = 1
-        ttk.Label(main_frame, text="觸發熱鍵：", style="Sub.TLabel").grid(row=row, column=0, sticky="w", pady=5)
-        ttk.Entry(main_frame, textvariable=self.hotkey_str, width=15, font=("Microsoft JhengHei", 11)).grid(row=row, column=1, sticky="w", pady=5)
-        ttk.Label(main_frame, text="（按住此鍵觸發巨集）", font=("Microsoft JhengHei", 9)).grid(row=row, column=2, sticky="w", pady=5)
+        ttk.Label(main_frame, text="觸發熱鍵：", style="Sub.TLabel").grid(
+            row=row, column=0, sticky="w", pady=5)
+        ttk.Entry(main_frame, textvariable=self.hotkey_str, width=12,
+                  font=("Microsoft JhengHei", 11)).grid(row=row, column=1, sticky="w", pady=5)
+        ttk.Label(main_frame, text="（按住觸發 / Toggle 模式時按下啟動）",
+                  font=("Microsoft JhengHei", 9)).grid(row=row, column=2, columnspan=2, sticky="w", pady=5)
         
-        # ── 停止鍵 ─────────────────────────────────────
         row += 1
-        ttk.Label(main_frame, text="停止熱鍵：", style="Sub.TLabel").grid(row=row, column=0, sticky="w", pady=5)
-        ttk.Entry(main_frame, text=self.stop_hotkey, width=15, font=("Microsoft JhengHei", 11), state="readonly").grid(row=row, column=1, sticky="w", pady=5)
-        ttk.Label(main_frame, text="（隨時中斷發送）", font=("Microsoft JhengHei", 9)).grid(row=row, column=2, sticky="w", pady=5)
+        ttk.Label(main_frame, text="停止熱鍵：", style="Sub.TLabel").grid(
+            row=row, column=0, sticky="w", pady=5)
+        ttk.Entry(main_frame, textvariable=self.stop_hotkey_str, width=12,
+                  font=("Microsoft JhengHei", 11)).grid(row=row, column=1, sticky="w", pady=5)
+        ttk.Label(main_frame, text="（立即中斷發送）",
+                  font=("Microsoft JhengHei", 9)).grid(row=row, column=2, columnspan=2, sticky="w", pady=5)
         
-        # ── 目標視窗 ───────────────────────────────────
+        # Toggle 模式
         row += 1
-        ttk.Label(main_frame, text="目標視窗：", style="Sub.TLabel").grid(row=row, column=0, sticky="w", pady=5)
+        ttk.Checkbutton(main_frame, text="🔄 同一鍵開關（Toggle 模式）",
+                        variable=self.toggle_mode,
+                        style="Sub.TCheckbutton").grid(
+                            row=row, column=0, columnspan=2, sticky="w", pady=5)
+        ttk.Label(main_frame, text="（同一熱鍵：第一次按下啟動，再按一次停止）",
+                  font=("Microsoft JhengHei", 9)).grid(
+                      row=row, column=2, columnspan=2, sticky="w", pady=5)
         
-        # 上方：下拉選單 + 重新整理按鈕
+        # ── 目標視窗 ─────────────────────────────────
+        row += 1
+        ttk.Separator(main_frame, orient="horizontal").grid(
+            row=row, column=0, columnspan=4, sticky="ew", pady=6)
+        
+        row += 1
+        ttk.Label(main_frame, text="目標視窗：", style="Sub.TLabel").grid(
+            row=row, column=0, sticky="w", pady=5)
+        
         sel_frame = ttk.Frame(main_frame)
-        sel_frame.grid(row=row, column=1, columnspan=2, sticky="w", pady=5)
+        sel_frame.grid(row=row, column=1, columnspan=3, sticky="w", pady=5)
         
-        self.window_combo = ttk.Combobox(sel_frame, textvariable=self.window_var, 
-                                          width=38, state="readonly", font=("Microsoft JhengHei", 10))
+        self.window_combo = ttk.Combobox(sel_frame, textvariable=self.window_var,
+                                          width=40, state="readonly", font=("Microsoft JhengHei", 10))
         self.window_combo.pack(side="left", padx=(0, 5))
         self.window_combo.bind("<<ComboboxSelected>>", self._on_window_selected)
         
         ttk.Button(sel_frame, text="🔄 重新整理", command=self._refresh_windows, width=10).pack(side="left", padx=2)
         
-        # 下方：說明 + 目前選取
-        ttk.Label(main_frame, text="（選擇目標視窗，或留空表示前景視窗）", 
-                  font=("Microsoft JhengHei", 9), foreground="gray").grid(
-                      row=row+1, column=1, columnspan=2, sticky="w")
-        self.selected_hwnd = [0]  # 選中的視窗 handle
-        
-        # ── 巨集序列 ───────────────────────────────────
-        row += 2
-        ttk.Separator(main_frame, orient="horizontal").grid(row=row, column=0, columnspan=3, sticky="ew", pady=8)
         row += 1
-        ttk.Label(main_frame, text="巨集序列（逗號分隔）：", style="Sub.TLabel").grid(row=row, column=0, sticky="nw", pady=5)
-        text_seq = tk.Text(main_frame, width=45, height=6, font=("Consolas", 10))
-        text_seq.grid(row=row, column=1, columnspan=2, sticky="w", pady=5)
-        self.text_seq = text_seq
+        ttk.Label(main_frame, text="（選擇目標視窗，留空表示前景視窗）",
+                  font=("Microsoft JhengHei", 9), foreground="gray").grid(
+                      row=row, column=1, columnspan=3, sticky="w")
+        self.selected_hwnd = [0]
+        
+        # ── 巨集序列 ─────────────────────────────────
+        row += 1
+        ttk.Separator(main_frame, orient="horizontal").grid(
+            row=row, column=0, columnspan=4, sticky="ew", pady=6)
+        
+        row += 1
+        ttk.Label(main_frame, text="巨集序列：", style="Sub.TLabel").grid(
+            row=row, column=0, sticky="nw", pady=5)
+        
+        seq_frame = ttk.Frame(main_frame)
+        seq_frame.grid(row=row, column=1, columnspan=3, sticky="w", pady=5)
+        
+        self.text_seq = tk.Text(seq_frame, width=48, height=6,
+                                  font=("Consolas", 10))
+        self.text_seq.pack(side="left", fill="both", expand=True)
+        
+        scroll_y = ttk.Scrollbar(seq_frame, orient="vertical", command=self.text_seq.yview)
+        scroll_y.pack(side="right", fill="y")
+        self.text_seq.configure(yscrollcommand=scroll_y.set)
         
         hint_text = (
-            "範例：\n"
-            "  ctrl+c       →  發送 Ctrl+C\n"
-            "  a, b, c      →  依序發送 A、B、C\n"
-            "  space        →  空白鍵\n"
-            "  shift+a      →  Shift+A（大寫 A）\n"
-            "  f1, f2, f3   →  依序按 F1、F2、F3\n"
-            "支援：ctrl/shift/alt/win + 按鍵組合"
+            "範例：  ctrl+c  |  a, b, c  |  space  |  shift+a  |  f1, f2, f3\n"
+            "支援：ctrl / shift / alt / win + 按鍵組合，逗號分隔表示依序發送"
         )
-        ttk.Label(main_frame, text=hint_text, font=("Microsoft JhengHei", 8), foreground="gray", justify="left").grid(
-            row=row+1, column=1, columnspan=2, sticky="w", padx=5
-        )
+        ttk.Label(main_frame, text=hint_text, font=("Microsoft JhengHei", 8),
+                  foreground="gray", justify="left").grid(
+                      row=row+1, column=1, columnspan=3, sticky="w")
         
-        # ── 頻率設定 ───────────────────────────────────
+        # ── 頻率設定 ─────────────────────────────────
         row += 2
-        ttk.Separator(main_frame, orient="horizontal").grid(row=row, column=0, columnspan=3, sticky="ew", pady=8)
+        ttk.Separator(main_frame, orient="horizontal").grid(
+            row=row, column=0, columnspan=4, sticky="ew", pady=6)
+        
         row += 1
-        
         freq_frame = ttk.Frame(main_frame)
-        freq_frame.grid(row=row, column=0, columnspan=3, sticky="w", pady=5)
+        freq_frame.grid(row=row, column=0, columnspan=4, sticky="w", pady=5)
         
-        ttk.Label(freq_frame, text="按鍵按住時間（ms）：").grid(row=0, column=0, sticky="w", padx=5)
-        ttk.Entry(freq_frame, textvariable=self.hold_ms, width=8).grid(row=0, column=1, sticky="w", padx=5)
+        fields = [
+            ("按鍵按住（ms）：", self.hold_ms, 0, 0),
+            ("按鍵間隔（ms）：", self.interval_ms, 0, 2),
+            ("重複次數：", self.repeat_count, 1, 0),
+            ("啟動前延遲（ms）：", self.delay_before, 1, 2),
+        ]
+        for label_text, var, r, c in fields:
+            ttk.Label(freq_frame, text=label_text).grid(row=r, column=c, sticky="w", padx=5, pady=(5,0))
+            ttk.Entry(freq_frame, textvariable=var, width=9).grid(row=r, column=c+1, sticky="w", padx=5, pady=(5,0))
         
-        ttk.Label(freq_frame, text="按鍵間隔（ms）：").grid(row=0, column=2, sticky="w", padx=5)
-        ttk.Entry(freq_frame, textvariable=self.interval_ms, width=8).grid(row=0, column=3, sticky="w", padx=5)
-        
-        ttk.Label(freq_frame, text="重複次數：").grid(row=1, column=0, sticky="w", padx=5, pady=(5,0))
-        ttk.Entry(freq_frame, textvariable=self.repeat_count, width=8).grid(row=1, column=1, sticky="w", padx=5, pady=(5,0))
-        
-        ttk.Label(freq_frame, text="啟動前延遲（ms）：").grid(row=1, column=2, sticky="w", padx=5, pady=(5,0))
-        ttk.Entry(freq_frame, textvariable=self.delay_before, width=8).grid(row=1, column=3, sticky="w", padx=5, pady=(5,0))
-        
-        # ── 按鈕列 ────────────────────────────────────
+        # ── 按鈕列 ─────────────────────────────────
         row += 1
         btn_frame = ttk.Frame(main_frame)
-        btn_frame.grid(row=row, column=0, columnspan=3, pady=15)
+        btn_frame.grid(row=row, column=0, columnspan=4, pady=12)
         
-        self.btn_toggle = ttk.Button(btn_frame, text="▶ 啟動監聽", command=self._toggle_listening, width=18)
+        self.btn_toggle = ttk.Button(btn_frame, text="▶ 啟動監聽",
+                                      command=self._toggle_listening, width=18)
         self.btn_toggle.pack(side="left", padx=5)
         
-        ttk.Button(btn_frame, text="🧪 測試發送（單次）", command=self._test_send, width=18).pack(side="left", padx=5)
-        ttk.Button(btn_frame, text="💾 儲存設定", command=self._save_config, width=14).pack(side="left", padx=5)
-        ttk.Button(btn_frame, text="📋 說明", command=self._show_help, width=10).pack(side="left", padx=5)
+        ttk.Button(btn_frame, text="🛑 立即停止", command=self._stop_all,
+                   width=14).pack(side="left", padx=5)
+        ttk.Button(btn_frame, text="💾 儲存設定", command=self._save_config,
+                   width=12).pack(side="left", padx=5)
+        ttk.Button(btn_frame, text="📋 說明", command=self._show_help,
+                   width=8).pack(side="left", padx=5)
         
-        # ── 狀態列 ────────────────────────────────────
+        # ── 狀態列 ─────────────────────────────────
         row += 1
-        self.status_label = tk.Label(main_frame, text="📴 未啟動", font=("Microsoft JhengHei", 10), fg="gray")
-        self.status_label.grid(row=row, column=0, columnspan=3, sticky="w", pady=(5, 0))
+        self.status_label = tk.Label(main_frame, text="📴 未啟動",
+                                       font=("Microsoft JhengHei", 10), fg="gray")
+        self.status_label.grid(row=row, column=0, columnspan=4, sticky="w", pady=(5, 0))
+        
+        self.active_label = tk.Label(main_frame, text="",
+                                       font=("Microsoft JhengHei", 9), fg="orange")
+        self.active_label.grid(row=row, column=1, columnspan=3, sticky="w", pady=(5, 0))
     
     def _refresh_windows(self):
-        """重新整理視窗列表"""
         try:
             self.window_list = get_all_windows()
             display_list = [f"{title}" for title, _ in self.window_list]
@@ -416,7 +511,6 @@ class KeyMacroGUI:
             self.window_combo["values"] = [f"（錯誤：{e}）"]
     
     def _on_window_selected(self, event):
-        """當使用者選擇視窗時更新 target_window"""
         idx = self.window_combo.current()
         if idx >= 0 and idx < len(self.window_list):
             title, hwnd = self.window_list[idx]
@@ -426,56 +520,88 @@ class KeyMacroGUI:
             self.target_window.set("")
             self.selected_hwnd[0] = 0
     
+    def _resolve_hwnd(self):
+        """解析目標視窗 hwnd，帶重試"""
+        if self.selected_hwnd[0] != 0 and win32gui.IsWindow(self.selected_hwnd[0]):
+            return self.selected_hwnd[0]
+        if self.target_window.get().strip():
+            hwnd = find_window_by_title(self.target_window.get().strip())
+            if hwnd:
+                return hwnd
+        return win32gui.GetForegroundWindow()
+    
     def _execute_macro(self):
         """執行巨集"""
         sequence = [k.strip() for k in self.text_seq.get("1.0", "end").strip().split(',') if k.strip()]
         if not sequence:
             return
         
+        hwnd = self._resolve_hwnd()
+        if not hwnd:
+            self._update_status("❌ 找不到目標視窗", "red")
+            return
+        
+        # 重設 stop_event 並清理舊執行緒
+        self.stop_event.clear()
+        
         hold = self.hold_ms.get()
         interval = self.interval_ms.get()
         repeat = self.repeat_count.get()
         delay = self.delay_before.get()
         
-        # 優先使用已選中的 hwnd，否則用名稱查詢
-        if self.selected_hwnd[0] != 0 and win32gui.IsWindow(self.selected_hwnd[0]):
-            hwnd = self.selected_hwnd[0]
-        elif self.target_window.get().strip():
-            hwnd = find_window_by_title(self.target_window.get().strip())
-            if hwnd == 0:
-                self._update_status(f"❌ 找不到視窗：{self.target_window.get()}", "red")
-                return
-        else:
-            hwnd = win32gui.GetForegroundWindow()
+        self._update_active("🔄 執行中...")
         
         def run():
             time.sleep(delay / 1000.0)
-            self._update_status(f"🔄 發送中...（{repeat}x）", "orange")
-            send_macro_sequence(sequence, hwnd, hold, interval, repeat)
-            self._update_status(f"✅ 發送完成", "green")
-            time.sleep(1)
-            self._update_status(f"📡 監聽中：{self.hotkey_str.get()}", "blue")
+            self._update_status("⚙️ 發送中...", "orange")
+            send_macro_sequence(sequence, hwnd, hold, interval, repeat, self.stop_event)
+            
+            if self.stop_event.is_set():
+                self._update_status("⏹ 已中斷", "red")
+            else:
+                self._update_status("✅ 發送完成", "green")
+            
+            time.sleep(0.5)
+            if not self.stop_event.is_set():
+                self._update_status(f"📡 監聽中：{self.hotkey_str.get()}", "blue")
+            self._update_active("")
         
-        threading.Thread(target=run, daemon=True).start()
+        t = threading.Thread(target=run, daemon=True)
+        with self.lock:
+            self.active_threads.append(t)
+            self._cleanup_threads()
+        t.start()
     
-    def _stop_macro(self):
+    def _stop_all(self):
+        """立即停止所有進行中的巨集"""
+        self.stop_event.set()
+        with self.lock:
+            for t in self.active_threads:
+                # daemon=True 的執行緒會隨著 mainloop 結束而中斷
+                pass
         self._update_status("⏹ 已中斷", "red")
+        self._update_active("")
     
-    def _test_send(self):
-        self._execute_macro()
+    def _cleanup_threads(self):
+        """清理已結束的執行緒引用"""
+        self.active_threads = [t for t in self.active_threads if t.is_alive()]
     
     def _toggle_listening(self):
         if not self.is_running:
-            hotkey = self.hotkey_str.get().strip()
-            if not hotkey:
+            trigger = self.hotkey_str.get().strip()
+            stop = self.stop_hotkey_str.get().strip()
+            if not trigger:
                 messagebox.showwarning("警告", "請輸入觸發熱鍵")
                 return
-            self.listener.start(hotkey)
+            
+            self.manager.start(trigger, stop, self.toggle_mode.get())
             self.is_running = True
             self.btn_toggle.config(text="⏹ 停止監聽")
-            self._update_status(f"📡 監聽中：{hotkey}", "blue")
+            mode_desc = "（Toggle 模式）" if self.toggle_mode.get() else "（按住觸發）"
+            self._update_status(f"📡 監聽中：{trigger} {mode_desc}", "blue")
         else:
-            self.listener.stop()
+            self._stop_all()
+            self.manager.stop()
             self.is_running = False
             self.btn_toggle.config(text="▶ 啟動監聽")
             self._update_status("📴 已停止", "gray")
@@ -485,12 +611,18 @@ class KeyMacroGUI:
             self.status_label.config(text=text, fg=color)
         self.root.after(0, _inner)
     
+    def _update_active(self, text: str):
+        def _inner():
+            self.active_label.config(text=text)
+        self.root.after(0, _inner)
+    
     def _get_config_path(self):
         return os.path.join(os.path.dirname(os.path.abspath(__file__)), "config.json")
     
     def _save_config(self):
         cfg = {
             "hotkey": self.hotkey_str.get(),
+            "stop_hotkey": self.stop_hotkey_str.get(),
             "target_window": self.target_window.get(),
             "selected_hwnd": self.selected_hwnd[0],
             "sequence": self.text_seq.get("1.0", "end").strip(),
@@ -498,6 +630,7 @@ class KeyMacroGUI:
             "interval_ms": self.interval_ms.get(),
             "repeat_count": self.repeat_count.get(),
             "delay_before": self.delay_before.get(),
+            "toggle_mode": self.toggle_mode.get(),
         }
         with open(self._get_config_path(), "w", encoding="utf-8") as f:
             json.dump(cfg, f, ensure_ascii=False, indent=2)
@@ -510,6 +643,7 @@ class KeyMacroGUI:
                 with open(path, encoding="utf-8") as f:
                     cfg = json.load(f)
                 self.hotkey_str.set(cfg.get("hotkey", "f1"))
+                self.stop_hotkey_str.set(cfg.get("stop_hotkey", "f2"))
                 saved_title = cfg.get("target_window", "")
                 saved_hwnd = cfg.get("selected_hwnd", 0)
                 self.text_seq.insert("1.0", cfg.get("sequence", "a, b, c"))
@@ -517,14 +651,12 @@ class KeyMacroGUI:
                 self.interval_ms.set(cfg.get("interval_ms", 100))
                 self.repeat_count.set(cfg.get("repeat_count", 1))
                 self.delay_before.set(cfg.get("delay_before", 500))
+                self.toggle_mode.set(cfg.get("toggle_mode", False))
                 
-                # 嘗試恢復選中的視窗
                 if saved_hwnd and win32gui.IsWindow(saved_hwnd):
                     self.selected_hwnd[0] = saved_hwnd
                     self.target_window.set(saved_title)
                     self.window_var.set(saved_title)
-                    
-                    # 如果清單中有這個視窗，選中它
                     for i, (title, hwnd) in enumerate(self.window_list):
                         if hwnd == saved_hwnd:
                             self.window_combo.current(i)
@@ -539,24 +671,23 @@ class KeyMacroGUI:
         help_text = (
             "【KeyMacro 使用說明】\n\n"
             "1. 從下拉選單選擇目標遊戲視窗\n"
-            "2. 設定觸發熱鍵（按住時觸發，如 F1）\n"
-            "3. 輸入巨集序列，用逗號分隔（如 ctrl+c, a, b）\n"
-            "4. 設定按鍵頻率、重複次數\n"
-            "5. 點擊「啟動監聽」\n"
-            "6. 切換到遊戲，按住熱鍵即可觸發\n\n"
+            "2. 設定觸發熱鍵（按住時觸發巨集）\n"
+            "3. 設定停止熱鍵（立即中斷發送）\n"
+            "4. ✓ 勾選「同一鍵開關」可讓同一按鍵 toggle 啟/停\n"
+            "5. 輸入巨集序列，用逗號分隔\n"
+            "6. 設定頻率、重複次數後啟動監聽\n"
+            "7. 切換到遊戲，按住熱鍵觸發\n\n"
             "【巨集格式】\n"
-            "  a, b, c         → 依序發送 A → B → C\n"
-            "  ctrl+c          → Ctrl+C\n"
-            "  shift+a         → Shift+A\n"
-            "  alt+f4          → Alt+F4\n"
-            "  space, enter    → 空白鍵 → Enter\n"
-            "  f1, f2, f3      → F1 → F2 → F3\n\n"
-            "【視窗選擇】\n"
-            "  從下拉選單選擇目標遊戲\n"
-            "  留空（選擇第一項）表示發送至前景視窗\n"
-            "  點擊「重新整理」更新視窗列表\n\n"
-            "【停止鍵】\n"
-            "  F2 可隨時中斷發送"
+            "  a, b, c       → 依序發送 A → B → C\n"
+            "  ctrl+c        → Ctrl+C（複製）\n"
+            "  shift+a       → Shift+A（大寫）\n"
+            "  alt+f4        → Alt+F4\n"
+            "  space, enter  → 空白鍵 → Enter\n"
+            "  f1, f2, f3   → F1 → F2 → F3\n\n"
+            "【停止方式】\n"
+            "  • 停止熱鍵（預設 F2）\n"
+            "  • Toggle 模式：再按一次觸發鍵\n"
+            "  • 「立即停止」按鈕"
         )
         messagebox.showinfo("說明", help_text)
     
@@ -568,9 +699,7 @@ class KeyMacroGUI:
 # ═══════════════════════════════════════════════════════════
 
 if __name__ == "__main__":
-    import ctypes
     ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID("KeyMacro.App")
-    
     root = tk.Tk()
     app = KeyMacroGUI(root)
     app.run()
