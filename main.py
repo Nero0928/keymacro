@@ -158,6 +158,32 @@ def find_window_by_title(title: str) -> int:
     win32gui.EnumWindows(callback, None)
     return result[0]
 
+def get_all_windows() -> list:
+    """取得所有可見視窗的標題列表（排除空的、重複的）"""
+    windows = []
+    seen_titles = set()
+    
+    def callback(hwnd, _):
+        if win32gui.IsWindowVisible(hwnd):
+            title = win32gui.GetWindowText(hwnd).strip()
+            if title and title not in seen_titles:
+                # 排除系統視窗
+                try:
+                    cls_name = win32gui.GetClassName(hwnd)
+                    if cls_name in ('WorkerW', 'Shell_TrayWnd', 'DV2ControlHost', 
+                                    'MsgrIMEWindowClass', 'Windows.UI.Core.CoreWindow'):
+                        return True
+                except:
+                    pass
+                windows.append((title, hwnd))
+                seen_titles.add(title)
+        return True
+    
+    win32gui.EnumWindows(callback, None)
+    # 按視窗標題排序
+    windows.sort(key=lambda x: x[0].lower())
+    return windows
+
 def send_macro_sequence(sequence: list, hwnd: int, hold_ms: float, interval_ms: float, repeat: int):
     """發送一連串按鍵（巨集）"""
     for _ in range(repeat):
@@ -259,6 +285,8 @@ class KeyMacroGUI:
         self.is_running = False
         self.listener_thread = None
         self.stop_hotkey = "f2"
+        self.window_var = tk.StringVar(value="")
+        self.window_list = []  # (title, hwnd)
         
         self.listener = HotkeyListener(
             on_activate=self._execute_macro,
@@ -266,6 +294,7 @@ class KeyMacroGUI:
         )
         
         self._build_ui()
+        self._refresh_windows()
         self._load_config()
     
     def _build_ui(self):
@@ -295,9 +324,23 @@ class KeyMacroGUI:
         # ── 目標視窗 ───────────────────────────────────
         row += 1
         ttk.Label(main_frame, text="目標視窗：", style="Sub.TLabel").grid(row=row, column=0, sticky="w", pady=5)
-        entry_target = ttk.Entry(main_frame, textvariable=self.target_window, width=30, font=("Microsoft JhengHei", 11))
-        entry_target.grid(row=row, column=1, columnspan=2, sticky="w", pady=5)
-        ttk.Label(main_frame, text="（留空表示前景視窗）", font=("Microsoft JhengHei", 9), foreground="gray").grid(row=row+1, column=1, columnspan=2, sticky="w")
+        
+        # 上方：下拉選單 + 重新整理按鈕
+        sel_frame = ttk.Frame(main_frame)
+        sel_frame.grid(row=row, column=1, columnspan=2, sticky="w", pady=5)
+        
+        self.window_combo = ttk.Combobox(sel_frame, textvariable=self.window_var, 
+                                          width=38, state="readonly", font=("Microsoft JhengHei", 10))
+        self.window_combo.pack(side="left", padx=(0, 5))
+        self.window_combo.bind("<<ComboboxSelected>>", self._on_window_selected)
+        
+        ttk.Button(sel_frame, text="🔄 重新整理", command=self._refresh_windows, width=10).pack(side="left", padx=2)
+        
+        # 下方：說明 + 目前選取
+        ttk.Label(main_frame, text="（選擇目標視窗，或留空表示前景視窗）", 
+                  font=("Microsoft JhengHei", 9), foreground="gray").grid(
+                      row=row+1, column=1, columnspan=2, sticky="w")
+        self.selected_hwnd = [0]  # 選中的視窗 handle
         
         # ── 巨集序列 ───────────────────────────────────
         row += 2
@@ -358,6 +401,31 @@ class KeyMacroGUI:
         self.status_label = tk.Label(main_frame, text="📴 未啟動", font=("Microsoft JhengHei", 10), fg="gray")
         self.status_label.grid(row=row, column=0, columnspan=3, sticky="w", pady=(5, 0))
     
+    def _refresh_windows(self):
+        """重新整理視窗列表"""
+        try:
+            self.window_list = get_all_windows()
+            display_list = [f"{title}" for title, _ in self.window_list]
+            if not display_list:
+                display_list = ["（目前沒有可見視窗）"]
+            self.window_combo["values"] = display_list
+            if display_list and display_list[0] != "（目前沒有可見視窗）":
+                self.window_combo.current(0)
+                self._on_window_selected(None)
+        except Exception as e:
+            self.window_combo["values"] = [f"（錯誤：{e}）"]
+    
+    def _on_window_selected(self, event):
+        """當使用者選擇視窗時更新 target_window"""
+        idx = self.window_combo.current()
+        if idx >= 0 and idx < len(self.window_list):
+            title, hwnd = self.window_list[idx]
+            self.target_window.set(title)
+            self.selected_hwnd[0] = hwnd
+        else:
+            self.target_window.set("")
+            self.selected_hwnd[0] = 0
+    
     def _execute_macro(self):
         """執行巨集"""
         sequence = [k.strip() for k in self.text_seq.get("1.0", "end").strip().split(',') if k.strip()]
@@ -369,11 +437,13 @@ class KeyMacroGUI:
         repeat = self.repeat_count.get()
         delay = self.delay_before.get()
         
-        target = self.target_window.get().strip()
-        if target:
-            hwnd = find_window_by_title(target)
+        # 優先使用已選中的 hwnd，否則用名稱查詢
+        if self.selected_hwnd[0] != 0 and win32gui.IsWindow(self.selected_hwnd[0]):
+            hwnd = self.selected_hwnd[0]
+        elif self.target_window.get().strip():
+            hwnd = find_window_by_title(self.target_window.get().strip())
             if hwnd == 0:
-                self._update_status(f"❌ 找不到視窗：{target}", "red")
+                self._update_status(f"❌ 找不到視窗：{self.target_window.get()}", "red")
                 return
         else:
             hwnd = win32gui.GetForegroundWindow()
@@ -422,6 +492,7 @@ class KeyMacroGUI:
         cfg = {
             "hotkey": self.hotkey_str.get(),
             "target_window": self.target_window.get(),
+            "selected_hwnd": self.selected_hwnd[0],
             "sequence": self.text_seq.get("1.0", "end").strip(),
             "hold_ms": self.hold_ms.get(),
             "interval_ms": self.interval_ms.get(),
@@ -439,22 +510,38 @@ class KeyMacroGUI:
                 with open(path, encoding="utf-8") as f:
                     cfg = json.load(f)
                 self.hotkey_str.set(cfg.get("hotkey", "f1"))
-                self.target_window.set(cfg.get("target_window", ""))
+                saved_title = cfg.get("target_window", "")
+                saved_hwnd = cfg.get("selected_hwnd", 0)
                 self.text_seq.insert("1.0", cfg.get("sequence", "a, b, c"))
                 self.hold_ms.set(cfg.get("hold_ms", 50))
                 self.interval_ms.set(cfg.get("interval_ms", 100))
                 self.repeat_count.set(cfg.get("repeat_count", 1))
                 self.delay_before.set(cfg.get("delay_before", 500))
+                
+                # 嘗試恢復選中的視窗
+                if saved_hwnd and win32gui.IsWindow(saved_hwnd):
+                    self.selected_hwnd[0] = saved_hwnd
+                    self.target_window.set(saved_title)
+                    self.window_var.set(saved_title)
+                    
+                    # 如果清單中有這個視窗，選中它
+                    for i, (title, hwnd) in enumerate(self.window_list):
+                        if hwnd == saved_hwnd:
+                            self.window_combo.current(i)
+                            break
+                elif saved_title:
+                    self.target_window.set(saved_title)
+                    self.window_var.set(saved_title)
             except Exception:
                 pass
     
     def _show_help(self):
         help_text = (
             "【KeyMacro 使用說明】\n\n"
-            "1. 設定觸發熱鍵（按住時觸發，如 F1）\n"
-            "2. 輸入巨集序列，用逗號分隔（如 ctrl+c, a, b）\n"
-            "3. 設定按鍵頻率、重複次數\n"
-            "4. 指定目標視窗（留空表示前景）\n"
+            "1. 從下拉選單選擇目標遊戲視窗\n"
+            "2. 設定觸發熱鍵（按住時觸發，如 F1）\n"
+            "3. 輸入巨集序列，用逗號分隔（如 ctrl+c, a, b）\n"
+            "4. 設定按鍵頻率、重複次數\n"
             "5. 點擊「啟動監聽」\n"
             "6. 切換到遊戲，按住熱鍵即可觸發\n\n"
             "【巨集格式】\n"
@@ -464,6 +551,10 @@ class KeyMacroGUI:
             "  alt+f4          → Alt+F4\n"
             "  space, enter    → 空白鍵 → Enter\n"
             "  f1, f2, f3      → F1 → F2 → F3\n\n"
+            "【視窗選擇】\n"
+            "  從下拉選單選擇目標遊戲\n"
+            "  留空（選擇第一項）表示發送至前景視窗\n"
+            "  點擊「重新整理」更新視窗列表\n\n"
             "【停止鍵】\n"
             "  F2 可隨時中斷發送"
         )
